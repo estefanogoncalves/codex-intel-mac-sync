@@ -39,6 +39,7 @@ Build options:
   --electron-version <ver>     Electron version (default: 40.0.0)
   --better-sqlite3-version <v> better-sqlite3 version (default: 12.5.0)
   --node-pty-version <ver>     node-pty version (default: 1.1.0)
+  --llvm-prefix <path>         LLVM prefix for Monterey/native rebuild fallback
 
 Repackage options:
   --cli-bin <path>             Force Intel codex CLI path (binary or npm launcher)
@@ -108,6 +109,132 @@ first_existing() {
   return 1
 }
 
+append_env_flag() {
+  local var_name="$1"
+  local value="$2"
+  local current="${!var_name:-}"
+
+  if [[ -n "$current" ]]; then
+    printf -v "$var_name" '%s %s' "$current" "$value"
+  else
+    printf -v "$var_name" '%s' "$value"
+  fi
+
+  export "$var_name"
+}
+
+toolchain_probe() {
+  local compiler="$1"
+  local include_dir="${2:-}"
+  local sdkroot="${3:-}"
+  local tmpdir source_file object_file status
+
+  [[ -x "$compiler" ]] || return 1
+
+  tmpdir="$(mktemp -d)"
+  source_file="${tmpdir}/electron-toolchain-probe.cc"
+  object_file="${tmpdir}/electron-toolchain-probe.o"
+
+  cat > "$source_file" <<'EOF'
+#include <concepts>
+#include <source_location>
+
+int main() {
+  auto location = std::source_location::current();
+  (void)location;
+  return 0;
+}
+EOF
+
+  if [[ -n "$include_dir" && -n "$sdkroot" ]]; then
+    "$compiler" -std=c++20 -I"$include_dir" -isysroot "$sdkroot" -c "$source_file" -o "$object_file" >/dev/null 2>&1
+  elif [[ -n "$include_dir" ]]; then
+    "$compiler" -std=c++20 -I"$include_dir" -c "$source_file" -o "$object_file" >/dev/null 2>&1
+  elif [[ -n "$sdkroot" ]]; then
+    "$compiler" -std=c++20 -isysroot "$sdkroot" -c "$source_file" -o "$object_file" >/dev/null 2>&1
+  else
+    "$compiler" -std=c++20 -c "$source_file" -o "$object_file" >/dev/null 2>&1
+  fi
+  status=$?
+
+  rm -rf "$tmpdir"
+  return "$status"
+}
+
+detect_llvm_prefix() {
+  local candidate=""
+
+  if [[ -n "$LLVM_PREFIX" ]]; then
+    [[ -d "$LLVM_PREFIX" ]] || die "LLVM prefix does not exist: $LLVM_PREFIX"
+    printf '%s\n' "$LLVM_PREFIX"
+    return 0
+  fi
+
+  if command -v brew >/dev/null 2>&1; then
+    candidate="$(brew --prefix llvm 2>/dev/null || true)"
+    if [[ -n "$candidate" && -d "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+
+  candidate="$(first_existing /usr/local/opt/llvm /opt/homebrew/opt/llvm || true)"
+  [[ -n "$candidate" ]] || return 1
+  printf '%s\n' "$candidate"
+}
+
+configure_build_toolchain() {
+  local sdkroot=""
+  local llvm_prefix=""
+  local llvm_include_dir=""
+
+  sdkroot="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
+  if [[ -n "$sdkroot" ]]; then
+    export SDKROOT="$sdkroot"
+  fi
+
+  append_env_flag CXXFLAGS "-std=c++20"
+
+  if toolchain_probe "$(command -v clang++)" "" "$sdkroot"; then
+    log "Using system Apple clang toolchain"
+    return 0
+  fi
+
+  llvm_prefix="$(detect_llvm_prefix || true)"
+  if [[ -n "$llvm_prefix" ]]; then
+    llvm_include_dir="${llvm_prefix}/include/c++/v1"
+    if [[ -d "$llvm_include_dir" ]] && toolchain_probe "$(command -v clang++)" "$llvm_include_dir" "$sdkroot"; then
+      export CPLUS_INCLUDE_PATH="${llvm_include_dir}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+      append_env_flag CPPFLAGS "-I${llvm_include_dir}"
+      log "Apple clang is missing Electron 40 libc++ headers; using headers from ${llvm_prefix}"
+      return 0
+    fi
+
+    if [[ -x "${llvm_prefix}/bin/clang" && -x "${llvm_prefix}/bin/clang++" ]] && \
+       [[ -d "$llvm_include_dir" ]] && \
+       toolchain_probe "${llvm_prefix}/bin/clang++" "$llvm_include_dir" "$sdkroot"; then
+      export CC="${llvm_prefix}/bin/clang"
+      export CXX="${llvm_prefix}/bin/clang++"
+      export CPLUS_INCLUDE_PATH="${llvm_include_dir}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+      append_env_flag CPPFLAGS "-I${llvm_include_dir}"
+      log "Using LLVM toolchain from ${llvm_prefix} for Electron native rebuild"
+      return 0
+    fi
+  fi
+
+  cat >&2 <<EOF
+Electron ${ELECTRON_VERSION} native rebuild requires libc++ headers that provide <source_location>.
+The Apple toolchain on this machine cannot compile those headers.
+
+On Monterey, install Homebrew LLVM and rerun:
+  brew install llvm
+
+If LLVM is installed in a non-default location, pass:
+  --llvm-prefix /path/to/llvm
+EOF
+  exit 1
+}
+
 is_x86_64_binary() {
   local path="$1"
   local info
@@ -134,6 +261,22 @@ copy_dir() {
   rm -rf "$dst"
   mkdir -p "$(dirname "$dst")"
   ditto "$src" "$dst"
+}
+
+copy_executable() {
+  local src="$1"
+  local dst="$2"
+  copy_file "$src" "$dst"
+  chmod +x "$dst"
+}
+
+write_artifact_paths_env() {
+  cat > "${WORKDIR}/artifact-paths.env" <<EOF
+ELECTRON_APP=${ELECTRON_APP}
+BETTER_SQLITE3_NODE=${BETTER_SQLITE3_NODE}
+PTY_NODE=${PTY_NODE}
+SPAWN_HELPER=${SPAWN_HELPER}
+EOF
 }
 
 find_app_in_dir() {
@@ -280,10 +423,397 @@ detect_cli_bin() {
   return 1
 }
 
+resolve_build_artifact_paths() {
+  ELECTRON_APP="${WORKDIR}/node_modules/electron/dist/Electron.app"
+  BETTER_SQLITE3_NODE="${WORKDIR}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+  PTY_NODE="$(first_existing \
+    "${WORKDIR}/node_modules/node-pty/build/Release/pty.node" \
+    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/pty.node")"
+  SPAWN_HELPER="$(first_existing \
+    "${WORKDIR}/node_modules/node-pty/build/Release/spawn-helper" \
+    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper")"
+}
+
+require_build_artifacts() {
+  require_dir "$ELECTRON_APP"
+  require_file "$BETTER_SQLITE3_NODE"
+  require_file "$PTY_NODE"
+  require_file "$SPAWN_HELPER"
+}
+
+init_workdir_npm_project() {
+  mkdir -p "$WORKDIR"
+  cd "$WORKDIR"
+
+  if [[ ! -f package.json ]]; then
+    log "Initializing npm project in $WORKDIR"
+    npm init -y >/dev/null
+  fi
+}
+
+copy_framework_bundle() {
+  local framework_name="$1"
+  copy_dir \
+    "${ELECTRON_APP}/Contents/Frameworks/${framework_name}" \
+    "${OUTPUT_APP}/Contents/Frameworks/${framework_name}"
+}
+
+copy_helper_binary() {
+  local electron_helper_name="$1"
+  local codex_helper_name="$2"
+
+  copy_executable \
+    "${ELECTRON_APP}/Contents/Frameworks/${electron_helper_name}.app/Contents/MacOS/${electron_helper_name}" \
+    "${OUTPUT_APP}/Contents/Frameworks/${codex_helper_name}.app/Contents/MacOS/${codex_helper_name}"
+}
+
+require_electron_runtime_layout() {
+  local framework_name helper_name
+
+  require_file "${ELECTRON_APP}/Contents/MacOS/Electron"
+  require_dir "${ELECTRON_APP}/Contents/Frameworks"
+
+  for framework_name in \
+    "Electron Framework.framework" \
+    "Mantle.framework" \
+    "ReactiveObjC.framework" \
+    "Squirrel.framework"
+  do
+    require_dir "${ELECTRON_APP}/Contents/Frameworks/${framework_name}"
+  done
+
+  for helper_name in \
+    "Electron Helper" \
+    "Electron Helper (GPU)" \
+    "Electron Helper (Plugin)" \
+    "Electron Helper (Renderer)"
+  do
+    require_file "${ELECTRON_APP}/Contents/Frameworks/${helper_name}.app/Contents/MacOS/${helper_name}"
+  done
+}
+
+copy_electron_runtime() {
+  local framework_name
+
+  log "Replacing Electron runtime binaries with x64 versions"
+  copy_executable "${ELECTRON_APP}/Contents/MacOS/Electron" "${OUTPUT_APP}/Contents/MacOS/Codex"
+
+  copy_helper_binary "Electron Helper" "Codex Helper"
+  copy_helper_binary "Electron Helper (GPU)" "Codex Helper (GPU)"
+  copy_helper_binary "Electron Helper (Plugin)" "Codex Helper (Plugin)"
+  copy_helper_binary "Electron Helper (Renderer)" "Codex Helper (Renderer)"
+
+  for framework_name in \
+    "Electron Framework.framework" \
+    "Mantle.framework" \
+    "ReactiveObjC.framework" \
+    "Squirrel.framework"
+  do
+    copy_framework_bundle "$framework_name"
+  done
+}
+
+install_native_addons() {
+  local output_resources_dir="$1"
+  local output_unpacked_dir="${output_resources_dir}/app.asar.unpacked"
+
+  log "Installing x64 native addons"
+  copy_executable \
+    "$BETTER_SQLITE3_NODE" \
+    "${output_unpacked_dir}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
+
+  copy_executable \
+    "$PTY_NODE" \
+    "${output_unpacked_dir}/node_modules/node-pty/build/Release/pty.node"
+  copy_executable \
+    "$PTY_NODE" \
+    "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/pty.node"
+
+  copy_executable \
+    "$SPAWN_HELPER" \
+    "${output_unpacked_dir}/node_modules/node-pty/build/Release/spawn-helper"
+  copy_executable \
+    "$SPAWN_HELPER" \
+    "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper"
+}
+
+bundle_cli_artifact() {
+  local output_resources_dir="$1"
+  local output_unpacked_dir="${output_resources_dir}/app.asar.unpacked"
+
+  if [[ "$SKIP_CLI_BUNDLE" -eq 0 ]]; then
+    log "Bundling x64 codex CLI"
+    copy_executable "$CLI_BIN" "${output_resources_dir}/codex"
+    copy_executable "$CLI_BIN" "${output_unpacked_dir}/codex"
+    return 0
+  fi
+
+  log "Skipping bundled CLI"
+  rm -f "${output_resources_dir}/codex"
+  rm -f "${output_unpacked_dir}/codex"
+}
+
+install_optional_sparkle() {
+  local output_resources_dir="$1"
+  local output_unpacked_dir="${output_resources_dir}/app.asar.unpacked"
+
+  if [[ -n "$SPARKLE_NODE" ]]; then
+    log "Installing x64 sparkle.node"
+    copy_executable "$SPARKLE_NODE" "${output_resources_dir}/native/sparkle.node"
+    copy_executable "$SPARKLE_NODE" "${output_unpacked_dir}/native/sparkle.node"
+    return 0
+  fi
+
+  log "Removing sparkle.node (auto-update disabled)"
+  rm -f "${output_resources_dir}/native/sparkle.node"
+  rm -f "${output_unpacked_dir}/native/sparkle.node"
+}
+
+sanitize_and_sign_app() {
+  log "Removing stale signatures and quarantine metadata"
+  find "$OUTPUT_APP" -name _CodeSignature -type d -prune -exec rm -rf {} +
+  xattr -cr "$OUTPUT_APP"
+
+  log "Ad-hoc signing rebuilt app"
+  codesign --force --deep --sign - "$OUTPUT_APP"
+  log "Verifying signature"
+  codesign --verify --deep --strict "$OUTPUT_APP"
+}
+
+prepare_output_app_bundle() {
+  log "Copying source app bundle"
+  rm -rf "$OUTPUT_APP"
+  mkdir -p "$(dirname "$OUTPUT_APP")"
+  ditto "$SOURCE_APP" "$OUTPUT_APP"
+}
+
+resolve_dmg_source_app_path() {
+  if [[ -n "$DMG_SOURCE_APP" ]]; then
+    printf '%s\n' "$DMG_SOURCE_APP"
+    return 0
+  fi
+
+  if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
+    printf '%s\n' "$OUTPUT_APP"
+    return 0
+  fi
+
+  if [[ -n "$SOURCE_APP" ]]; then
+    printf '%s\n' "$SOURCE_APP"
+    return 0
+  fi
+
+  printf '%s\n' "$OUTPUT_APP"
+}
+
+configure_run_modes() {
+  if [[ "$OUTPUT_FLAG_SET" -eq 0 ]]; then
+    WANT_DMG=1
+  fi
+
+  if [[ "$MODE_EXPLICIT" -eq 0 ]]; then
+    RUN_BUILD=1
+    RUN_REPACKAGE=1
+    RUN_DMG="$WANT_DMG"
+  fi
+
+  if [[ "$RUN_BUILD" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
+    RUN_BUILD=0
+  fi
+
+  if [[ "$RUN_REPACKAGE" -eq 1 && "$WANT_APP" -eq 0 && "$RUN_DMG" -eq 1 && "$MODE_EXPLICIT" -eq 0 ]]; then
+    TEMP_OUTPUT_APP="${REPO_ROOT}/.build/tmp/Codex-Intel.app"
+    OUTPUT_APP="$TEMP_OUTPUT_APP"
+  fi
+}
+
+cleanup_temp_output_app() {
+  if [[ "$TEMP_APP_CREATED" -eq 1 ]]; then
+    rm -rf "$TEMP_OUTPUT_APP"
+  fi
+}
+
+set_mode_flags() {
+  local run_build="$1"
+  local run_repackage="$2"
+  local run_dmg="$3"
+
+  MODE_EXPLICIT=1
+  RUN_BUILD="$run_build"
+  RUN_REPACKAGE="$run_repackage"
+  RUN_DMG="$run_dmg"
+}
+
+set_default_source_dmg() {
+  if [[ -f "${REPO_ROOT}/Codex.dmg" ]]; then
+    SOURCE_DMG="${REPO_ROOT}/Codex.dmg"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --build-only)
+        set_mode_flags 1 0 0
+        shift
+        ;;
+      --repackage-only)
+        set_mode_flags 0 1 0
+        shift
+        ;;
+      --dmg-only)
+        set_mode_flags 0 0 1
+        shift
+        ;;
+      --app)
+        WANT_APP=1
+        OUTPUT_FLAG_SET=1
+        shift
+        ;;
+      --source-app)
+        SOURCE_APP="${2:-}"
+        shift 2
+        ;;
+      --source-dmg)
+        SOURCE_DMG="${2:-}"
+        shift 2
+        ;;
+      --dmg-source-app)
+        DMG_SOURCE_APP="${2:-}"
+        shift 2
+        ;;
+      --output-app)
+        OUTPUT_APP="${2:-}"
+        shift 2
+        ;;
+      --output-dmg)
+        OUTPUT_DMG="${2:-}"
+        shift 2
+        ;;
+      --workdir)
+        WORKDIR="${2:-}"
+        shift 2
+        ;;
+      --dmg)
+        WANT_DMG=1
+        OUTPUT_FLAG_SET=1
+        shift
+        ;;
+      --skip-build)
+        SKIP_BUILD=1
+        shift
+        ;;
+      --force-clean)
+        FORCE_CLEAN=1
+        shift
+        ;;
+      --electron-version)
+        ELECTRON_VERSION="${2:-}"
+        shift 2
+        ;;
+      --better-sqlite3-version)
+        BETTER_SQLITE3_VERSION="${2:-}"
+        shift 2
+        ;;
+      --node-pty-version)
+        NODE_PTY_VERSION="${2:-}"
+        shift 2
+        ;;
+      --llvm-prefix)
+        LLVM_PREFIX="${2:-}"
+        shift 2
+        ;;
+      --cli-bin)
+        CLI_BIN="${2:-}"
+        shift 2
+        ;;
+      --skip-cli-bundle)
+        SKIP_CLI_BUNDLE=1
+        shift
+        ;;
+      --sparkle-node)
+        SPARKLE_NODE="${2:-}"
+        shift 2
+        ;;
+      --volname)
+        VOLNAME="${2:-}"
+        shift 2
+        ;;
+      --window-width)
+        DMG_WINDOW_WIDTH="${2:-}"
+        shift 2
+        ;;
+      --window-height)
+        DMG_WINDOW_HEIGHT="${2:-}"
+        shift 2
+        ;;
+      --window-left)
+        DMG_WINDOW_LEFT="${2:-}"
+        shift 2
+        ;;
+      --window-top)
+        DMG_WINDOW_TOP="${2:-}"
+        shift 2
+        ;;
+      --app-icon-x)
+        DMG_APP_ICON_X="${2:-}"
+        shift 2
+        ;;
+      --app-icon-y)
+        DMG_APP_ICON_Y="${2:-}"
+        shift 2
+        ;;
+      --apps-icon-x)
+        DMG_APPS_ICON_X="${2:-}"
+        shift 2
+        ;;
+      --apps-icon-y)
+        DMG_APPS_ICON_Y="${2:-}"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+run_requested_steps() {
+  if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
+    ensure_source_app
+  fi
+
+  if [[ "$RUN_BUILD" -eq 1 ]]; then
+    log "Preparing Intel artifacts"
+    prepare_artifacts
+  fi
+
+  if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
+    log "Repackaging app"
+    repackage_app
+    if [[ -n "$TEMP_OUTPUT_APP" ]]; then
+      TEMP_APP_CREATED=1
+    fi
+  fi
+
+  if [[ "$RUN_DMG" -eq 1 ]]; then
+    DMG_SOURCE_APP="$(resolve_dmg_source_app_path)"
+    log "Creating dmg"
+    make_dmg "$DMG_SOURCE_APP" "$OUTPUT_DMG"
+  fi
+
+  cleanup_temp_output_app
+}
+
 prepare_artifacts() {
   require_command npm
   require_command npx
   require_command xcode-select
+  require_command xcrun
 
   if ! xcode-select -p >/dev/null 2>&1; then
     log "Xcode Command Line Tools are required."
@@ -292,18 +822,14 @@ prepare_artifacts() {
     die "Install Xcode Command Line Tools, then run again."
   fi
 
+  configure_build_toolchain
+
   if [[ "$FORCE_CLEAN" -eq 1 ]]; then
     log "Removing existing workdir: $WORKDIR"
     rm -rf "$WORKDIR"
   fi
 
-  mkdir -p "$WORKDIR"
-  cd "$WORKDIR"
-
-  if [[ ! -f package.json ]]; then
-    log "Initializing npm project in $WORKDIR"
-    npm init -y >/dev/null
-  fi
+  init_workdir_npm_project
 
   log "Installing build dependencies"
   npm install \
@@ -325,26 +851,9 @@ prepare_artifacts() {
     --version "$ELECTRON_VERSION" \
     --module-dir .
 
-  ELECTRON_APP="${WORKDIR}/node_modules/electron/dist/Electron.app"
-  BETTER_SQLITE3_NODE="${WORKDIR}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-  PTY_NODE="$(first_existing \
-    "${WORKDIR}/node_modules/node-pty/build/Release/pty.node" \
-    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/pty.node")"
-  SPAWN_HELPER="$(first_existing \
-    "${WORKDIR}/node_modules/node-pty/build/Release/spawn-helper" \
-    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper")"
-
-  require_dir "$ELECTRON_APP"
-  require_file "$BETTER_SQLITE3_NODE"
-  require_file "$PTY_NODE"
-  require_file "$SPAWN_HELPER"
-
-  cat > "${WORKDIR}/artifact-paths.env" <<EOF
-ELECTRON_APP=${ELECTRON_APP}
-BETTER_SQLITE3_NODE=${BETTER_SQLITE3_NODE}
-PTY_NODE=${PTY_NODE}
-SPAWN_HELPER=${SPAWN_HELPER}
-EOF
+  resolve_build_artifact_paths
+  require_build_artifacts
+  write_artifact_paths_env
 }
 
 resolve_source_app() {
@@ -395,20 +904,11 @@ ensure_source_app() {
 
 resolve_artifacts_from_workdir() {
   require_dir "$WORKDIR"
-
-  ELECTRON_APP="${WORKDIR}/node_modules/electron/dist/Electron.app"
-  BETTER_SQLITE3_NODE="${WORKDIR}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-  PTY_NODE="$(first_existing \
-    "${WORKDIR}/node_modules/node-pty/build/Release/pty.node" \
-    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/pty.node")"
-  SPAWN_HELPER="$(first_existing \
-    "${WORKDIR}/node_modules/node-pty/build/Release/spawn-helper" \
-    "${WORKDIR}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper")"
+  resolve_build_artifact_paths
 }
 
 repackage_app() {
-  local output_frameworks_dir output_resources_dir output_unpacked_dir
-  local framework helper
+  local output_resources_dir
   local resolved_cli_bin=""
 
   resolve_artifacts_from_workdir
@@ -437,10 +937,7 @@ repackage_app() {
   fi
 
   require_dir "$SOURCE_APP"
-  require_dir "$ELECTRON_APP"
-  require_file "$BETTER_SQLITE3_NODE"
-  require_file "$PTY_NODE"
-  require_file "$SPAWN_HELPER"
+  require_build_artifacts
   if [[ "$SKIP_CLI_BUNDLE" -eq 0 ]]; then
     require_x86_64_binary "$CLI_BIN"
   fi
@@ -448,117 +945,14 @@ repackage_app() {
     require_file "$SPARKLE_NODE"
   fi
 
-  local electron_main="${ELECTRON_APP}/Contents/MacOS/Electron"
-  local electron_frameworks_dir="${ELECTRON_APP}/Contents/Frameworks"
-  require_file "$electron_main"
-  require_dir "$electron_frameworks_dir"
-
-  for framework in \
-    "Electron Framework.framework" \
-    "Mantle.framework" \
-    "ReactiveObjC.framework" \
-    "Squirrel.framework"
-  do
-    require_dir "${electron_frameworks_dir}/${framework}"
-  done
-
-  for helper in \
-    "Electron Helper.app/Contents/MacOS/Electron Helper" \
-    "Electron Helper (GPU).app/Contents/MacOS/Electron Helper (GPU)" \
-    "Electron Helper (Plugin).app/Contents/MacOS/Electron Helper (Plugin)" \
-    "Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer)"
-  do
-    require_file "${electron_frameworks_dir}/${helper}"
-  done
-
-  log "Copying source app bundle"
-  rm -rf "$OUTPUT_APP"
-  mkdir -p "$(dirname "$OUTPUT_APP")"
-  ditto "$SOURCE_APP" "$OUTPUT_APP"
-
-  output_frameworks_dir="${OUTPUT_APP}/Contents/Frameworks"
+  require_electron_runtime_layout
+  prepare_output_app_bundle
   output_resources_dir="${OUTPUT_APP}/Contents/Resources"
-  output_unpacked_dir="${output_resources_dir}/app.asar.unpacked"
-
-  log "Replacing Electron runtime binaries with x64 versions"
-  copy_file "$electron_main" "${OUTPUT_APP}/Contents/MacOS/Codex"
-  chmod +x "${OUTPUT_APP}/Contents/MacOS/Codex"
-
-  copy_file \
-    "${electron_frameworks_dir}/Electron Helper.app/Contents/MacOS/Electron Helper" \
-    "${output_frameworks_dir}/Codex Helper.app/Contents/MacOS/Codex Helper"
-  chmod +x "${output_frameworks_dir}/Codex Helper.app/Contents/MacOS/Codex Helper"
-
-  copy_file \
-    "${electron_frameworks_dir}/Electron Helper (GPU).app/Contents/MacOS/Electron Helper (GPU)" \
-    "${output_frameworks_dir}/Codex Helper (GPU).app/Contents/MacOS/Codex Helper (GPU)"
-  chmod +x "${output_frameworks_dir}/Codex Helper (GPU).app/Contents/MacOS/Codex Helper (GPU)"
-
-  copy_file \
-    "${electron_frameworks_dir}/Electron Helper (Plugin).app/Contents/MacOS/Electron Helper (Plugin)" \
-    "${output_frameworks_dir}/Codex Helper (Plugin).app/Contents/MacOS/Codex Helper (Plugin)"
-  chmod +x "${output_frameworks_dir}/Codex Helper (Plugin).app/Contents/MacOS/Codex Helper (Plugin)"
-
-  copy_file \
-    "${electron_frameworks_dir}/Electron Helper (Renderer).app/Contents/MacOS/Electron Helper (Renderer)" \
-    "${output_frameworks_dir}/Codex Helper (Renderer).app/Contents/MacOS/Codex Helper (Renderer)"
-  chmod +x "${output_frameworks_dir}/Codex Helper (Renderer).app/Contents/MacOS/Codex Helper (Renderer)"
-
-  for framework in \
-    "Electron Framework.framework" \
-    "Mantle.framework" \
-    "ReactiveObjC.framework" \
-    "Squirrel.framework"
-  do
-    copy_dir "${electron_frameworks_dir}/${framework}" "${output_frameworks_dir}/${framework}"
-  done
-
-  log "Installing x64 native addons"
-  copy_file "$BETTER_SQLITE3_NODE" "${output_unpacked_dir}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-  chmod +x "${output_unpacked_dir}/node_modules/better-sqlite3/build/Release/better_sqlite3.node"
-
-  copy_file "$PTY_NODE" "${output_unpacked_dir}/node_modules/node-pty/build/Release/pty.node"
-  chmod +x "${output_unpacked_dir}/node_modules/node-pty/build/Release/pty.node"
-  copy_file "$PTY_NODE" "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/pty.node"
-  chmod +x "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/pty.node"
-
-  copy_file "$SPAWN_HELPER" "${output_unpacked_dir}/node_modules/node-pty/build/Release/spawn-helper"
-  chmod +x "${output_unpacked_dir}/node_modules/node-pty/build/Release/spawn-helper"
-  copy_file "$SPAWN_HELPER" "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper"
-  chmod +x "${output_unpacked_dir}/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper"
-
-  if [[ "$SKIP_CLI_BUNDLE" -eq 0 ]]; then
-    log "Bundling x64 codex CLI"
-    copy_file "$CLI_BIN" "${output_resources_dir}/codex"
-    chmod +x "${output_resources_dir}/codex"
-    copy_file "$CLI_BIN" "${output_unpacked_dir}/codex"
-    chmod +x "${output_unpacked_dir}/codex"
-  else
-    log "Skipping bundled CLI"
-    rm -f "${output_resources_dir}/codex"
-    rm -f "${output_unpacked_dir}/codex"
-  fi
-
-  if [[ -n "$SPARKLE_NODE" ]]; then
-    log "Installing x64 sparkle.node"
-    copy_file "$SPARKLE_NODE" "${output_resources_dir}/native/sparkle.node"
-    chmod +x "${output_resources_dir}/native/sparkle.node"
-    copy_file "$SPARKLE_NODE" "${output_unpacked_dir}/native/sparkle.node"
-    chmod +x "${output_unpacked_dir}/native/sparkle.node"
-  else
-    log "Removing sparkle.node (auto-update disabled)"
-    rm -f "${output_resources_dir}/native/sparkle.node"
-    rm -f "${output_unpacked_dir}/native/sparkle.node"
-  fi
-
-  log "Removing stale signatures and quarantine metadata"
-  find "$OUTPUT_APP" -name _CodeSignature -type d -prune -exec rm -rf {} +
-  xattr -cr "$OUTPUT_APP"
-
-  log "Ad-hoc signing rebuilt app"
-  codesign --force --deep --sign - "$OUTPUT_APP"
-  log "Verifying signature"
-  codesign --verify --deep --strict "$OUTPUT_APP"
+  copy_electron_runtime
+  install_native_addons "$output_resources_dir"
+  bundle_cli_artifact "$output_resources_dir"
+  install_optional_sparkle "$output_resources_dir"
+  sanitize_and_sign_app
 
   if [[ "$SKIP_CLI_BUNDLE" -eq 1 ]]; then
     printf '\nCLI was not bundled. Launch with:\n'
@@ -665,6 +1059,7 @@ WORKDIR="${REPO_ROOT}/.build/codex-intel-build"
 ELECTRON_VERSION="40.0.0"
 BETTER_SQLITE3_VERSION="12.5.0"
 NODE_PTY_VERSION="1.1.0"
+LLVM_PREFIX=""
 
 VOLNAME="Codex Intel"
 DMG_WINDOW_WIDTH=840
@@ -700,9 +1095,7 @@ OUTPUT_FLAG_SET=0
 TEMP_OUTPUT_APP=""
 TEMP_APP_CREATED=0
 
-if [[ -f "${REPO_ROOT}/Codex.dmg" ]]; then
-  SOURCE_DMG="${REPO_ROOT}/Codex.dmg"
-fi
+set_default_source_dmg
 
 if [[ $# -eq 0 ]]; then
   usage
@@ -710,192 +1103,10 @@ if [[ $# -eq 0 ]]; then
   exit 0
 fi
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --build-only)
-      MODE_EXPLICIT=1
-      RUN_BUILD=1
-      RUN_REPACKAGE=0
-      RUN_DMG=0
-      shift
-      ;;
-    --repackage-only)
-      MODE_EXPLICIT=1
-      RUN_BUILD=0
-      RUN_REPACKAGE=1
-      shift
-      ;;
-    --dmg-only)
-      MODE_EXPLICIT=1
-      RUN_BUILD=0
-      RUN_REPACKAGE=0
-      RUN_DMG=1
-      shift
-      ;;
-    --app)
-      WANT_APP=1
-      OUTPUT_FLAG_SET=1
-      shift
-      ;;
-    --source-app)
-      SOURCE_APP="${2:-}"
-      shift 2
-      ;;
-    --source-dmg)
-      SOURCE_DMG="${2:-}"
-      shift 2
-      ;;
-    --dmg-source-app)
-      DMG_SOURCE_APP="${2:-}"
-      shift 2
-      ;;
-    --output-app)
-      OUTPUT_APP="${2:-}"
-      shift 2
-      ;;
-    --output-dmg)
-      OUTPUT_DMG="${2:-}"
-      shift 2
-      ;;
-    --workdir)
-      WORKDIR="${2:-}"
-      shift 2
-      ;;
-    --dmg)
-      WANT_DMG=1
-      OUTPUT_FLAG_SET=1
-      shift
-      ;;
-    --skip-build)
-      SKIP_BUILD=1
-      shift
-      ;;
-    --force-clean)
-      FORCE_CLEAN=1
-      shift
-      ;;
-    --electron-version)
-      ELECTRON_VERSION="${2:-}"
-      shift 2
-      ;;
-    --better-sqlite3-version)
-      BETTER_SQLITE3_VERSION="${2:-}"
-      shift 2
-      ;;
-    --node-pty-version)
-      NODE_PTY_VERSION="${2:-}"
-      shift 2
-      ;;
-    --cli-bin)
-      CLI_BIN="${2:-}"
-      shift 2
-      ;;
-    --skip-cli-bundle)
-      SKIP_CLI_BUNDLE=1
-      shift
-      ;;
-    --sparkle-node)
-      SPARKLE_NODE="${2:-}"
-      shift 2
-      ;;
-    --volname)
-      VOLNAME="${2:-}"
-      shift 2
-      ;;
-    --window-width)
-      DMG_WINDOW_WIDTH="${2:-}"
-      shift 2
-      ;;
-    --window-height)
-      DMG_WINDOW_HEIGHT="${2:-}"
-      shift 2
-      ;;
-    --window-left)
-      DMG_WINDOW_LEFT="${2:-}"
-      shift 2
-      ;;
-    --window-top)
-      DMG_WINDOW_TOP="${2:-}"
-      shift 2
-      ;;
-    --app-icon-x)
-      DMG_APP_ICON_X="${2:-}"
-      shift 2
-      ;;
-    --app-icon-y)
-      DMG_APP_ICON_Y="${2:-}"
-      shift 2
-      ;;
-    --apps-icon-x)
-      DMG_APPS_ICON_X="${2:-}"
-      shift 2
-      ;;
-    --apps-icon-y)
-      DMG_APPS_ICON_Y="${2:-}"
-      shift 2
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    *)
-      die "Unknown argument: $1"
-      ;;
-  esac
-done
+parse_args "$@"
 
-if [[ "$OUTPUT_FLAG_SET" -eq 0 ]]; then
-  WANT_DMG=1
-fi
+configure_run_modes
 
-if [[ "$MODE_EXPLICIT" -eq 0 ]]; then
-  RUN_BUILD=1
-  RUN_REPACKAGE=1
-  RUN_DMG="$WANT_DMG"
-fi
-
-if [[ "$RUN_BUILD" -eq 1 && "$SKIP_BUILD" -eq 1 ]]; then
-  RUN_BUILD=0
-fi
-
-if [[ "$RUN_REPACKAGE" -eq 1 && "$WANT_APP" -eq 0 && "$RUN_DMG" -eq 1 && "$MODE_EXPLICIT" -eq 0 ]]; then
-  TEMP_OUTPUT_APP="${REPO_ROOT}/.build/tmp/Codex-Intel.app"
-  OUTPUT_APP="$TEMP_OUTPUT_APP"
-fi
-
-if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
-  ensure_source_app
-fi
-
-if [[ "$RUN_BUILD" -eq 1 ]]; then
-  log "Preparing Intel artifacts"
-  prepare_artifacts
-fi
-
-if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
-  log "Repackaging app"
-  repackage_app
-  if [[ -n "$TEMP_OUTPUT_APP" ]]; then
-    TEMP_APP_CREATED=1
-  fi
-fi
-
-if [[ "$RUN_DMG" -eq 1 ]]; then
-  if [[ -z "$DMG_SOURCE_APP" ]]; then
-    if [[ "$RUN_REPACKAGE" -eq 1 ]]; then
-      DMG_SOURCE_APP="$OUTPUT_APP"
-    elif [[ -n "$SOURCE_APP" ]]; then
-      DMG_SOURCE_APP="$SOURCE_APP"
-    else
-      DMG_SOURCE_APP="$OUTPUT_APP"
-    fi
-  fi
-  log "Creating dmg"
-  make_dmg "$DMG_SOURCE_APP" "$OUTPUT_DMG"
-fi
-
-if [[ "$TEMP_APP_CREATED" -eq 1 ]]; then
-  rm -rf "$TEMP_OUTPUT_APP"
-fi
+run_requested_steps
 
 log "Completed"
